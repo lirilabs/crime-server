@@ -20,7 +20,7 @@ export default async function handler(req, res) {
   };
 
   // ============================================================
-  // RECURSIVE FOLDER READER
+  // RECURSIVE FOLDER READER WITH SHA MAP
   // ============================================================
   async function readFolder(path = "") {
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
@@ -35,6 +35,7 @@ export default async function handler(req, res) {
         list.push({
           name: item.name,
           type: "directory",
+          sha: item.sha,
           path: item.path,
           children: await readFolder(item.path)
         });
@@ -44,12 +45,35 @@ export default async function handler(req, res) {
         list.push({
           name: item.name,
           type: "file",
+          sha: item.sha,
           path: item.path,
           content
         });
       }
     }
     return list;
+  }
+
+  // Build SHA map from structure
+  function buildShaMap(structure) {
+    const shaMap = {};
+    function traverse(items) {
+      items.forEach(item => {
+        shaMap[item.path] = item.sha;
+        if (item.type === "directory" && item.children) {
+          traverse(item.children);
+        }
+      });
+    }
+    traverse(structure);
+    return shaMap;
+  }
+
+  // Get full snapshot
+  async function getSnapshot() {
+    const structure = await readFolder("");
+    const shaMap = buildShaMap(structure);
+    return { structure, shaMap };
   }
 
   // ============================================================
@@ -75,8 +99,8 @@ export default async function handler(req, res) {
 
     setInterval(async () => {
       try {
-        const structure = await readFolder("");
-        broadcast({ structure, timestamp: Date.now() });
+        const snapshot = await getSnapshot();
+        broadcast(snapshot);
       } catch (e) {
         console.error("Watcher error:", e);
       }
@@ -187,9 +211,9 @@ export default async function handler(req, res) {
 
     subscribers.add(res);
 
-    // Send initial data
-    const structure = await readFolder("");
-    res.write(`data: ${JSON.stringify({ structure, timestamp: Date.now() })}\n\n`);
+    // Send initial structured snapshot
+    const snapshot = await getSnapshot();
+    res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
 
     // Remove on disconnect
     req.on("close", () => {
@@ -199,10 +223,10 @@ export default async function handler(req, res) {
     return;
   }
 
-  // GET - Read entire structure
+  // GET - Read entire structure with SHA map
   if (req.method === "GET") {
-    const structure = await readFolder("");
-    return res.status(200).json({ structure });
+    const snapshot = await getSnapshot();
+    return res.status(200).json(snapshot);
   }
 
   // POST - Create new file
@@ -215,14 +239,14 @@ export default async function handler(req, res) {
 
     const result = await saveFile(path, content, message || "create file");
     
-    // Broadcast update
-    const structure = await readFolder("");
-    broadcast({ structure, timestamp: Date.now() });
+    // Broadcast structured update
+    const snapshot = await getSnapshot();
+    broadcast(snapshot);
 
     return res.status(200).json(result);
   }
 
-  // PUT - Update existing file
+  // PUT - Update existing file or move
   if (req.method === "PUT") {
     const { path, content, message, action } = req.body;
 
@@ -230,8 +254,8 @@ export default async function handler(req, res) {
     if (action === "move" && req.body.newPath) {
       const result = await moveFile(path, req.body.newPath, message);
       
-      const structure = await readFolder("");
-      broadcast({ structure, timestamp: Date.now() });
+      const snapshot = await getSnapshot();
+      broadcast(snapshot);
       
       return res.status(200).json(result);
     }
@@ -243,9 +267,9 @@ export default async function handler(req, res) {
 
     const result = await saveFile(path, content, message || "update file");
     
-    // Broadcast update
-    const structure = await readFolder("");
-    broadcast({ structure, timestamp: Date.now() });
+    // Broadcast structured update
+    const snapshot = await getSnapshot();
+    broadcast(snapshot);
 
     return res.status(200).json(result);
   }
@@ -260,9 +284,9 @@ export default async function handler(req, res) {
 
     const result = await removeFile(path, message || "delete file");
     
-    // Broadcast update
-    const structure = await readFolder("");
-    broadcast({ structure, timestamp: Date.now() });
+    // Broadcast structured update
+    const snapshot = await getSnapshot();
+    broadcast(snapshot);
 
     return res.status(200).json(result);
   }
