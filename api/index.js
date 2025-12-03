@@ -1,15 +1,12 @@
 import fetch from "node-fetch";
 
-let subscribers = new Set();       
-let lastSnapshot = null;           // Cached structure+SHA map
-let lastSentJSON = "";             // For SSE dedup
-let watching = false;              // Ensure watcher runs once
+let subscribers = new Set();
+let watching = false;
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Cache-Control", "no-cache");
 
   if (req.method === "OPTIONS") return res.status(200).end();
 
@@ -17,18 +14,17 @@ export default async function handler(req, res) {
   const repo = "crime";
   const token = process.env.GITHUB_TOKEN;
 
-  const baseHeaders = {
+  const headers = {
     Authorization: `token ${token}`,
-    "User-Agent": "live-github-fs",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
+    "User-Agent": "live-github-fs"
   };
 
-  // --------------------------------------------------------------
-  // Recursive GitHub Folder Reader + SHA Snapshot
+  // ============================================================
+  // RECURSIVE FOLDER READER
+  // ============================================================
   async function readFolder(path = "") {
     const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
-    const resp = await fetch(url, { headers: baseHeaders });
+    const resp = await fetch(url, { headers });
     const arr = await resp.json();
 
     if (!Array.isArray(arr)) return [];
@@ -39,18 +35,15 @@ export default async function handler(req, res) {
         list.push({
           name: item.name,
           type: "directory",
-          sha: item.sha,
           path: item.path,
           children: await readFolder(item.path)
         });
       } else {
         const fileResp = await fetch(item.download_url);
         const content = await fileResp.text();
-
         list.push({
           name: item.name,
           type: "file",
-          sha: item.sha,
           path: item.path,
           content
         });
@@ -59,83 +52,49 @@ export default async function handler(req, res) {
     return list;
   }
 
-  // --------------------------------------------------------------
-  // GET FULL SNAPSHOT (structure + SHA-map)
-  async function getSnapshot() {
-    const structure = await readFolder("");
-    const shaMap = {};
-
-    function mapSHA(tree) {
-      tree.forEach(n => {
-        shaMap[n.path] = n.sha;
-        if (n.type === "directory") mapSHA(n.children);
-      });
-    }
-    mapSHA(structure);
-
-    return { structure, shaMap };
-  }
-
-  // --------------------------------------------------------------
-  // Live Push to all SSE subscribers
-  function pushUpdate(data) {
+  // ============================================================
+  // LIVE UPDATE BROADCASTER
+  // ============================================================
+  function broadcast(data) {
     const json = JSON.stringify(data);
-    if (json === lastSentJSON) return;
-    lastSentJSON = json;
-
-    for (const res of subscribers) {
-      try { res.write(`data: ${json}\n\n`); }
-      catch { }
+    for (const client of subscribers) {
+      try {
+        client.write(`data: ${json}\n\n`);
+      } catch (e) {
+        subscribers.delete(client);
+      }
     }
   }
 
-  // --------------------------------------------------------------
-  // Watcher loop (GitHub polling)
+  // ============================================================
+  // POLLING WATCHER
+  // ============================================================
   async function startWatcher() {
     if (watching) return;
     watching = true;
 
     setInterval(async () => {
       try {
-        const snapshot = await getSnapshot();
-
-        if (!lastSnapshot) {
-          lastSnapshot = snapshot;
-          pushUpdate(snapshot);
-          return;
-        }
-
-        let changed = false;
-
-        // Compare SHA maps
-        for (const path of Object.keys(snapshot.shaMap)) {
-          if (snapshot.shaMap[path] !== lastSnapshot.shaMap[path]) {
-            changed = true;
-            break;
-          }
-        }
-
-        if (changed) {
-          lastSnapshot = snapshot;
-          pushUpdate(snapshot);
-        }
-
+        const structure = await readFolder("");
+        broadcast({ structure, timestamp: Date.now() });
       } catch (e) {
         console.error("Watcher error:", e);
       }
-    }, 10000); // check every 10s
+    }, 5000); // Poll every 5 seconds
   }
 
-  startWatcher();
+  // ============================================================
+  // CRUD OPERATIONS
+  // ============================================================
 
-  // --------------------------------------------------------------
-  // CRUD UTILITIES
-  async function writeFile(path, content, message = "update") {
+  // CREATE/UPDATE FILE
+  async function saveFile(path, content, message = "update file") {
     let sha = null;
 
+    // Check if file exists
     const check = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
-      { headers: baseHeaders }
+      { headers }
     );
 
     if (check.status === 200) {
@@ -143,11 +102,12 @@ export default async function handler(req, res) {
       sha = info.sha;
     }
 
+    // Create or update
     const resp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
       {
         method: "PUT",
-        headers: { ...baseHeaders, "Content-Type": "application/json" },
+        headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify({
           message,
           content: Buffer.from(content).toString("base64"),
@@ -159,13 +119,16 @@ export default async function handler(req, res) {
     return resp.json();
   }
 
-  async function deleteFile(path, message = "delete") {
+  // DELETE FILE
+  async function removeFile(path, message = "delete file") {
     const getResp = await fetch(
       `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
-      { headers: baseHeaders }
+      { headers }
     );
 
-    if (getResp.status !== 200) return { error: "File not found" };
+    if (getResp.status !== 200) {
+      return { error: "File not found" };
+    }
 
     const fileInfo = await getResp.json();
 
@@ -173,7 +136,7 @@ export default async function handler(req, res) {
       `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
       {
         method: "DELETE",
-        headers: { ...baseHeaders, "Content-Type": "application/json" },
+        headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify({
           message,
           sha: fileInfo.sha
@@ -184,22 +147,51 @@ export default async function handler(req, res) {
     return resp.json();
   }
 
-  // --------------------------------------------------------------
-  // SSE Connection (stream=1)
+  // MOVE/RENAME FILE
+  async function moveFile(oldPath, newPath, message = "move file") {
+    // Read old file
+    const getResp = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/contents/${oldPath}`,
+      { headers }
+    );
+
+    if (getResp.status !== 200) {
+      return { error: "File not found" };
+    }
+
+    const fileInfo = await getResp.json();
+    const content = Buffer.from(fileInfo.content, "base64").toString();
+
+    // Create at new location
+    await saveFile(newPath, content, message);
+
+    // Delete old location
+    await removeFile(oldPath, message);
+
+    return { success: true, moved: `${oldPath} -> ${newPath}` };
+  }
+
+  // ============================================================
+  // ROUTES
+  // ============================================================
+
+  // SSE STREAM - Live Updates
   if (req.method === "GET" && req.query.stream === "1") {
+    startWatcher();
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache, no-transform",
+      "Cache-Control": "no-cache",
       "Connection": "keep-alive"
     });
 
     subscribers.add(res);
 
     // Send initial data
-    if (lastSnapshot)
-      res.write(`data: ${JSON.stringify(lastSnapshot)}\n\n`);
+    const structure = await readFolder("");
+    res.write(`data: ${JSON.stringify({ structure, timestamp: Date.now() })}\n\n`);
 
-    // Remove client on disconnect
+    // Remove on disconnect
     req.on("close", () => {
       subscribers.delete(res);
     });
@@ -207,54 +199,72 @@ export default async function handler(req, res) {
     return;
   }
 
-  // --------------------------------------------------------------
-  // Normal GET = return structure instantly
+  // GET - Read entire structure
   if (req.method === "GET") {
-    const snapshot = await getSnapshot();
-    lastSnapshot = snapshot;
-    return res.status(200).json(snapshot);
+    const structure = await readFolder("");
+    return res.status(200).json({ structure });
   }
 
-  // --------------------------------------------------------------
-  // POST = create
+  // POST - Create new file
   if (req.method === "POST") {
     const { path, content, message } = req.body;
-    const out = await writeFile(path, content, message);
+    
+    if (!path || content === undefined) {
+      return res.status(400).json({ error: "Missing path or content" });
+    }
 
-    // Push live update
-    const snapshot = await getSnapshot();
-    lastSnapshot = snapshot;
-    pushUpdate(snapshot);
+    const result = await saveFile(path, content, message || "create file");
+    
+    // Broadcast update
+    const structure = await readFolder("");
+    broadcast({ structure, timestamp: Date.now() });
 
-    return res.status(200).json(out);
+    return res.status(200).json(result);
   }
 
-  // --------------------------------------------------------------
-  // PUT = update
+  // PUT - Update existing file
   if (req.method === "PUT") {
-    const { path, content, message } = req.body;
-    const out = await writeFile(path, content, message);
+    const { path, content, message, action } = req.body;
 
-    // Push live update
-    const snapshot = await getSnapshot();
-    lastSnapshot = snapshot;
-    pushUpdate(snapshot);
+    // Handle MOVE/RENAME
+    if (action === "move" && req.body.newPath) {
+      const result = await moveFile(path, req.body.newPath, message);
+      
+      const structure = await readFolder("");
+      broadcast({ structure, timestamp: Date.now() });
+      
+      return res.status(200).json(result);
+    }
 
-    return res.status(200).json(out);
+    // Handle UPDATE
+    if (!path || content === undefined) {
+      return res.status(400).json({ error: "Missing path or content" });
+    }
+
+    const result = await saveFile(path, content, message || "update file");
+    
+    // Broadcast update
+    const structure = await readFolder("");
+    broadcast({ structure, timestamp: Date.now() });
+
+    return res.status(200).json(result);
   }
 
-  // --------------------------------------------------------------
-  // DELETE
+  // DELETE - Remove file
   if (req.method === "DELETE") {
     const { path, message } = req.body;
-    const out = await deleteFile(path, message);
 
-    // Push live update
-    const snapshot = await getSnapshot();
-    lastSnapshot = snapshot;
-    pushUpdate(snapshot);
+    if (!path) {
+      return res.status(400).json({ error: "Missing path" });
+    }
 
-    return res.status(200).json(out);
+    const result = await removeFile(path, message || "delete file");
+    
+    // Broadcast update
+    const structure = await readFolder("");
+    broadcast({ structure, timestamp: Date.now() });
+
+    return res.status(200).json(result);
   }
 
   return res.status(405).json({ error: "Method not allowed" });
