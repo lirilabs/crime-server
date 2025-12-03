@@ -20,6 +20,27 @@ export default async function handler(req, res) {
   };
 
   // ============================================================
+  // PARSE JSON CONTENT SAFELY
+  // ============================================================
+  function parseContent(rawContent, filename) {
+    try {
+      // Try parsing as JSON
+      if (filename.endsWith('.json')) {
+        // Remove comments from JSON
+        const cleaned = rawContent
+          .replace(/\/\*[\s\S]*?\*\//g, '') // Remove multi-line comments
+          .replace(/\/\/.*/g, '');          // Remove single-line comments
+        
+        return JSON.parse(cleaned);
+      }
+      return rawContent;
+    } catch (e) {
+      // Return raw content if parsing fails
+      return rawContent;
+    }
+  }
+
+  // ============================================================
   // RECURSIVE FOLDER READER WITH SHA MAP
   // ============================================================
   async function readFolder(path = "") {
@@ -40,15 +61,59 @@ export default async function handler(req, res) {
           children: await readFolder(item.path)
         });
       } else {
-        const fileResp = await fetch(item.download_url);
-        const content = await fileResp.text();
-        list.push({
-          name: item.name,
-          type: "file",
-          sha: item.sha,
-          path: item.path,
-          content
-        });
+        try {
+          // Fetch file content via GitHub API
+          const fileApiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${item.path}`;
+          const fileResp = await fetch(fileApiUrl, { headers });
+          
+          if (!fileResp.ok) {
+            console.error(`Failed to fetch ${item.name}: ${fileResp.status}`);
+            list.push({
+              name: item.name,
+              type: "file",
+              sha: item.sha,
+              path: item.path,
+              content: null,
+              error: `Failed to fetch content: ${fileResp.status}`,
+              size: item.size,
+              url: item.html_url
+            });
+            continue;
+          }
+
+          const fileData = await fileResp.json();
+          
+          // Decode base64 content
+          const rawContent = Buffer.from(fileData.content, 'base64').toString('utf-8');
+          
+          if (!rawContent || rawContent.trim() === '') {
+            console.warn(`Empty content for ${item.name}`);
+          }
+          
+          const parsedContent = parseContent(rawContent, item.name);
+          
+          list.push({
+            name: item.name,
+            type: "file",
+            sha: item.sha,
+            path: item.path,
+            content: parsedContent,
+            size: item.size,
+            url: item.html_url
+          });
+        } catch (error) {
+          console.error(`Error reading ${item.name}:`, error);
+          list.push({
+            name: item.name,
+            type: "file",
+            sha: item.sha,
+            path: item.path,
+            content: null,
+            error: error.message,
+            size: item.size,
+            url: item.html_url
+          });
+        }
       }
     }
     return list;
