@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GitHub CRUD UI — crime-server</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0f1724; --card:#0b1220; --muted:#9aa4b2; --accent:#60a5fa;
+      --success:#10b981; --danger:#ef4444; --glass: rgba(255,255,255,0.03);
+      font-family: Inter, system-ui, Arial, sans-serif;
+    }
+    body{margin:0;background:linear-gradient(180deg,#071124 0%, #07131a 100%);color:#e6eef6;min-height:100vh;padding:24px;}
+    .container{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:360px 1fr;gap:20px;}
+    .card{background:var(--card);padding:16px;border-radius:10px;box-shadow:0 6px 18px rgba(2,6,23,0.6);border:1px solid rgba(255,255,255,0.03);}
+    h1{font-size:18px;margin:0 0 12px 0}
+    button{background:var(--accent);border:none;padding:8px 10px;border-radius:8px;color:#042036;font-weight:600;cursor:pointer}
+    button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.06);color:var(--muted)}
+    input, textarea, select {width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:var(--glass);color:inherit;margin-top:6px}
+    textarea{min-height:140px;font-family:monospace;white-space:pre-wrap}
+    .small{font-size:13px;color:var(--muted)}
+    .tree{max-height:72vh;overflow:auto;padding:6px;border-radius:8px;background:linear-gradient(180deg, rgba(255,255,255,0.01), transparent)}
+    .node{padding:6px 8px;border-radius:6px;margin:2px 0;cursor:pointer}
+    .node:hover{background:rgba(255,255,255,0.02)}
+    .dir{font-weight:700;color:#bcdffb}
+    .file{font-family:monospace;color:var(--muted);display:flex;justify-content:space-between;gap:10px}
+    .file .meta{font-size:12px;color:#9aa4b2}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    .flex-col{display:flex;flex-direction:column;gap:8px}
+    .content-view{white-space:pre-wrap;background:#071827;padding:12px;border-radius:8px;overflow:auto;max-height:54vh;border:1px solid rgba(255,255,255,0.02)}
+    .danger{background:var(--danger);color:white}
+    .success{background:var(--success);color:#052017}
+    footer{grid-column:1/-1;margin-top:14px;color:var(--muted);font-size:13px;text-align:center}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>crime-server — Repo Browser & CRUD</h1>
+      <div class="small">Endpoint: <code id="api-url">https://crime-server-alpha.vercel.app/api</code></div>
+
+      <div style="margin-top:12px;" class="controls">
+        <button id="btn-refresh">Refresh Repo (GET)</button>
+        <button id="btn-clear" class="ghost">Clear View</button>
+      </div>
+
+      <hr style="border:none;border-top:1px solid rgba(255,255,255,0.03);margin:12px 0">
+
+      <div class="tree card" id="tree-root" aria-live="polite">
+        <!-- repo tree will be injected here -->
+        <div class="small">Click "Refresh Repo" to load repository structure.</div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="small">Click a file to view its content. Directory nodes expand.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h1>File inspector & CRUD</h1>
+
+      <div class="flex-col">
+        <label class="small">Selected path</label>
+        <input id="input-path" placeholder="e.g. src/index.js or README.md" />
+
+        <label class="small">Commit message</label>
+        <input id="input-message" placeholder="Optional commit message" />
+
+        <label class="small">Content (text / JSON)</label>
+        <textarea id="input-content" placeholder="File content here..."></textarea>
+
+        <div class="controls">
+          <button id="btn-create">Create (POST)</button>
+          <button id="btn-update">Update (PUT)</button>
+          <button id="btn-delete" class="danger">Delete (DELETE)</button>
+          <button id="btn-view" class="ghost">Get file from server</button>
+        </div>
+
+        <div style="display:flex;gap:10px;margin-top:8px;align-items:center;">
+          <label class="small" style="margin:0">Response</label>
+          <div id="status" class="small" style="flex:1;color:var(--muted)">No actions yet</div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid rgba(255,255,255,0.03);margin:8px 0">
+
+        <div>
+          <label class="small">File content / Server response</label>
+          <div id="content-view" class="content-view">No file selected</div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="small">Built to work with your API. If the server requires auth, provide a token on the server side (not here).</footer>
+  </div>
+
+  <script>
+    const API = "https://crime-server-alpha.vercel.app/api";
+    document.getElementById('api-url').textContent = API;
+
+    const el = {
+      treeRoot: document.getElementById('tree-root'),
+      btnRefresh: document.getElementById('btn-refresh'),
+      btnClear: document.getElementById('btn-clear'),
+      inputPath: document.getElementById('input-path'),
+      inputMessage: document.getElementById('input-message'),
+      inputContent: document.getElementById('input-content'),
+      btnCreate: document.getElementById('btn-create'),
+      btnUpdate: document.getElementById('btn-update'),
+      btnDelete: document.getElementById('btn-delete'),
+      btnView: document.getElementById('btn-view'),
+      contentView: document.getElementById('content-view'),
+      status: document.getElementById('status')
+    };
+
+    // Utility: show status
+    function setStatus(text, ok = true) {
+      el.status.textContent = text;
+      el.status.style.color = ok ? "var(--muted)" : "var(--danger)";
+    }
+
+    // Render tree recursively (structure expected from your API)
+    function renderTree(nodes, parentEl) {
+      parentEl.innerHTML = "";
+      (nodes || []).forEach(node => {
+        const div = document.createElement('div');
+        div.className = 'node ' + (node.type === 'directory' ? 'dir' : 'file');
+        if (node.type === 'directory') {
+          div.textContent = '📁 ' + node.name;
+          const childWrap = document.createElement('div');
+          childWrap.style.paddingLeft = '12px';
+          childWrap.style.display = 'none';
+          childWrap.className = "child-wrap";
+          div.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            childWrap.style.display = childWrap.style.display === 'none' ? 'block' : 'none';
+          });
+          parentEl.appendChild(div);
+          parentEl.appendChild(childWrap);
+          // node.children expected as array
+          if (node.children && node.children.length) {
+            renderTree(node.children, childWrap);
+          } else {
+            childWrap.innerHTML = '<div class="small" style="padding:6px">empty</div>';
+          }
+        } else {
+          // file node
+          const left = document.createElement('span');
+          left.textContent = node.name;
+          const right = document.createElement('span');
+          right.className = 'meta';
+          right.textContent = node.path || "";
+          div.appendChild(left);
+          div.appendChild(right);
+          div.addEventListener('click', async (ev) => {
+            ev.stopPropagation();
+            el.inputPath.value = node.path || node.name;
+            await fetchFile(node.path);
+          });
+          parentEl.appendChild(div);
+        }
+      });
+    }
+
+    // GET repo tree
+    async function refreshRepo() {
+      setStatus("Loading repo...");
+      el.contentView.textContent = "Loading...";
+      try {
+        const r = await fetch(API, { method: "GET" });
+        const j = await r.json();
+        if (!r.ok) {
+          setStatus("Failed to load repo: " + (j.error || JSON.stringify(j)), false);
+          el.treeRoot.innerHTML = "<div class='small'>Error reading repo</div>";
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+          return;
+        }
+
+        // Your API returns { structure: [...] } in the CRUD variant; earlier versions returned an array.
+        // Normalize to an array for rendering.
+        let nodes = null;
+        if (Array.isArray(j)) nodes = j;
+        else if (j.structure) nodes = j.structure;
+        else if (j.content) nodes = j.content; // fallback
+        else nodes = [];
+
+        renderTree(nodes, el.treeRoot);
+        setStatus("Repo loaded (" + (Array.isArray(nodes) ? nodes.length : 0) + " top-level items)");
+        el.contentView.textContent = "Repo loaded. Click a file to view its content.";
+      } catch (err) {
+        setStatus("Network error: " + err.message, false);
+        el.treeRoot.innerHTML = "<div class='small'>Network error</div>";
+        el.contentView.textContent = "";
+      }
+    }
+
+    // GET a single file from the server path (uses API's POST/GET behavior for file retrieval)
+    // We assume your API supports GET and returns the whole tree; if your API supports retrieving a single file via GET with ?path=...
+    async function fetchFile(path) {
+      if (!path) return;
+      setStatus("Loading file...");
+      el.contentView.textContent = "Loading file...";
+      try {
+        // Try GET (some servers might expect POST/PUT to fetch single file). We attempt to read the open repo content and find by path.
+        const r = await fetch(API, { method: "GET" });
+        const j = await r.json();
+        // Try to find the file node
+        function find(nodes, p) {
+          for (const n of nodes || []) {
+            if (n.type === "file" && n.path === p) return n;
+            if (n.type === "directory") {
+              const found = find(n.children, p);
+              if (found) return found;
+            }
+          }
+          return null;
+        }
+        const nodes = j.structure || j.content || j;
+        const node = find(nodes, path);
+        if (node && node.content !== undefined) {
+          el.contentView.textContent = typeof node.content === 'string' ? node.content : JSON.stringify(node.content, null, 2);
+          setStatus("File loaded");
+          return;
+        }
+
+        // Fallback: make a POST to server to fetch the file (some APIs expect POST)
+        const alt = await fetch(API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path })
+        });
+        const altJson = await alt.json();
+        if (!alt.ok) {
+          el.contentView.textContent = JSON.stringify(altJson, null, 2);
+          setStatus("Failed to fetch file", false);
+          return;
+        }
+        el.contentView.textContent = typeof altJson === 'string' ? altJson : JSON.stringify(altJson, null, 2);
+        setStatus("File loaded (via POST)");
+      } catch (err) {
+        el.contentView.textContent = err.message;
+        setStatus("Error: " + err.message, false);
+      }
+    }
+
+    // CREATE file (POST)
+    async function createFile() {
+      const path = el.inputPath.value.trim();
+      const content = el.inputContent.value;
+      const message = el.inputMessage.value || `create ${path}`;
+      if (!path) return setStatus("Path is required", false);
+      setStatus("Creating file...");
+      try {
+        const r = await fetch(API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path, content, message })
+        });
+        const j = await r.json();
+        if (r.ok) {
+          setStatus("File created");
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+          refreshRepo();
+        } else {
+          setStatus("Create failed: " + (j.message || JSON.stringify(j)), false);
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+        }
+      } catch (err) {
+        setStatus("Network error: " + err.message, false);
+      }
+    }
+
+    // UPDATE file (PUT)
+    async function updateFile() {
+      const path = el.inputPath.value.trim();
+      const content = el.inputContent.value;
+      const message = el.inputMessage.value || `update ${path}`;
+      if (!path) return setStatus("Path is required", false);
+      setStatus("Updating file...");
+      try {
+        const r = await fetch(API, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path, content, message })
+        });
+        const j = await r.json();
+        if (r.ok) {
+          setStatus("File updated");
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+          refreshRepo();
+        } else {
+          setStatus("Update failed: " + (j.message || JSON.stringify(j)), false);
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+        }
+      } catch (err) {
+        setStatus("Network error: " + err.message, false);
+      }
+    }
+
+    // DELETE file (DELETE)
+    async function deleteFile() {
+      const path = el.inputPath.value.trim();
+      const message = el.inputMessage.value || `delete ${path}`;
+      if (!path) return setStatus("Path is required", false);
+      if (!confirm("Delete " + path + " ? This is permanent.")) return;
+      setStatus("Deleting file...");
+      try {
+        const r = await fetch(API, {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path, message })
+        });
+        const j = await r.json();
+        if (r.ok) {
+          setStatus("File deleted");
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+          refreshRepo();
+        } else {
+          setStatus("Delete failed: " + (j.message || JSON.stringify(j)), false);
+          el.contentView.textContent = JSON.stringify(j, null, 2);
+        }
+      } catch (err) {
+        setStatus("Network error: " + err.message, false);
+      }
+    }
+
+    // Attach events
+    el.btnRefresh.addEventListener('click', refreshRepo);
+    el.btnClear.addEventListener('click', () => {
+      el.treeRoot.innerHTML = "<div class='small'>Cleared</div>";
+      el.contentView.textContent = "Cleared view";
+      setStatus("Cleared");
+    });
+    el.btnCreate.addEventListener('click', createFile);
+    el.btnUpdate.addEventListener('click', updateFile);
+    el.btnDelete.addEventListener('click', deleteFile);
+    el.btnView.addEventListener('click', () => fetchFile(el.inputPath.value.trim()));
+
+    // auto-load once
+    refreshRepo();
+  </script>
+</body>
+</html>
+
